@@ -1,6 +1,7 @@
 import type { AgentSession, AgentSessionEvent, AgentSessionEventListener } from "../../core/agent-session.ts";
 import type { AgentSessionRuntime } from "../../core/agent-session-runtime.ts";
 import type { AgentSessionRuntimeDiagnostic } from "../../core/agent-session-services.ts";
+import { SessionManager } from "../../core/session-manager.ts";
 import { type EnsuredHost, ensureHost } from "../rpc/host-ensure.ts";
 import { RpcClient, type RpcClientEvent } from "../rpc/rpc-client.ts";
 
@@ -58,25 +59,25 @@ export async function createInteractiveHostRuntime(
 
 class RemoteInteractiveRuntime {
 	readonly #local: AgentSessionRuntime;
-	readonly #session: AgentSession;
+	readonly #remoteSession: RemoteSessionProxy;
 	readonly #client: RpcClient;
 	#rebindSession: (() => Promise<void>) | undefined;
 	#beforeSessionInvalidate: (() => void) | undefined;
 
-	constructor(local: AgentSessionRuntime, session: AgentSession, client: RpcClient) {
+	constructor(local: AgentSessionRuntime, remoteSession: RemoteSessionProxy, client: RpcClient) {
 		this.#local = local;
-		this.#session = session;
+		this.#remoteSession = remoteSession;
 		this.#client = client;
 	}
 
 	get session(): AgentSession {
-		return this.#session;
+		return this.#remoteSession.session;
 	}
 	get services(): AgentSessionRuntime["services"] {
 		return this.#local.services;
 	}
 	get cwd(): string {
-		return this.#local.cwd;
+		return this.#remoteSession.session.sessionManager.getCwd();
 	}
 	get diagnostics(): readonly AgentSessionRuntimeDiagnostic[] {
 		return this.#local.diagnostics;
@@ -107,7 +108,7 @@ class RemoteInteractiveRuntime {
 	async switchSession(sessionPath: string): Promise<{ cancelled: boolean }> {
 		this.#beforeSessionInvalidate?.();
 		const result = await this.#client.switchSession(sessionPath);
-		if (!result.cancelled) await this.#rebindSession?.();
+		if (!result.cancelled) await this.#refreshAndRebind();
 		return result;
 	}
 	async fork(entryId: string): Promise<{ cancelled: boolean; selectedText?: string }> {
@@ -119,14 +120,25 @@ class RemoteInteractiveRuntime {
 	async importFromJsonl(): Promise<{ cancelled: boolean }> {
 		throw new Error("Session import is not available while connected to the shared host");
 	}
+
+	async #refreshAndRebind(): Promise<void> {
+		await this.#remoteSession.refresh();
+		await this.#rebindSession?.();
+	}
+}
+
+interface RemoteSessionProxy {
+	readonly session: AgentSession;
+	refresh(): Promise<void>;
 }
 
 function createRemoteSessionProxy(
 	local: AgentSession,
 	client: RpcClient,
 	initialState: ReturnType<typeof stateFromRpc>,
-): AgentSession {
+): RemoteSessionProxy {
 	let state = initialState;
+	let sessionManager = local.sessionManager;
 	let streamingAssistant: Extract<AgentSession["messages"][number], { role: "assistant" }> | undefined;
 	const listeners = new Set<AgentSessionEventListener>();
 	client.onEvent((wireEvent) => {
@@ -199,13 +211,29 @@ function createRemoteSessionProxy(
 			if (property === "isStreaming") return state.isStreaming;
 			if (property === "sessionFile") return state.sessionFile;
 			if (property === "sessionId") return state.sessionId;
+			if (property === "sessionManager") return sessionManager;
 			if (property === "messages") return target.messages;
 			if (property === "model") return state.model ?? target.model;
 			if (property === "thinkingLevel") return state.thinkingLevel;
 			return Reflect.get(target, property, receiver);
 		},
 	});
-	return session;
+	return {
+		session,
+		async refresh() {
+			const nextState = await client.getState();
+			state = stateFromRpc(nextState);
+			let messages: AgentSession["messages"];
+			if (nextState.sessionFile) {
+				sessionManager = SessionManager.open(nextState.sessionFile);
+				messages = sessionManager.buildSessionContext().messages;
+			} else {
+				messages = await client.getMessages();
+			}
+			local.agent.state.messages.splice(0, local.agent.state.messages.length, ...structuredClone(messages));
+			streamingAssistant = undefined;
+		},
+	};
 }
 
 function hydrateMessageUpdate(

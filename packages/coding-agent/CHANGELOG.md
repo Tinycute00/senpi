@@ -14,6 +14,10 @@
 
 ### Fixed
 
+- Shared-host `/resume` now completes for sessions with blocked or paused Goals and refreshes the interactive proxy's
+  session identity, manager, history, and token context instead of timing out or returning to the empty bootstrap
+  composer with a stale `0/1M` footer.
+
 - Imagegen missing-skill diagnostics now go to stderr, keeping RPC NDJSON stdout clean when a compiled binary lacks the optional skill asset.
 
 ### Removed
